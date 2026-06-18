@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Branch Protection — enforce merge path dev → staging → prod
+#
+# Runs on every PR targeting staging or prod.
+# Fails the PR if the source branch is not the expected predecessor.
+# Combined with GitHub branch protection rules ("Require status checks"),
+# this prevents bypassing the promotion order even with direct pushes.
+#
+# Configure in Settings → Branches → Branch protection rules:
+#   staging: require status check "Enforce merge path"
+#   prod:    require status check "Enforce merge path"
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Branch Protection
+
+on:
+  pull_request:
+    branches:
+      - staging
+      - prod
+
+permissions:
+  contents: read
+
+jobs:
+  enforce-merge-path:
+    name: "Enforce merge path"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check allowed source branch
+        run: |
+          BASE="${{ github.base_ref }}"
+          HEAD="${{ github.head_ref }}"
+
+          echo "PR: $HEAD → $BASE"
+
+          if [[ "$BASE" == "staging" && "$HEAD" != "develop" ]]; then
+            echo "ERROR: staging only accepts PRs from develop (got: $HEAD)"
+            exit 1
+          fi
+
+          if [[ "$BASE" == "prod" && "$HEAD" != "staging" ]]; then
+            echo "ERROR: prod only accepts PRs from staging (got: $HEAD)"
+            exit 1
+          fi
+
+          echo "OK: merge path is valid ($HEAD → $BASE)"

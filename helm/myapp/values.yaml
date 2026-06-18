@@ -1,0 +1,52 @@
+# Default values — overridden by values-<env>.yaml files at deploy time.
+
+replicaCount: 1
+
+image:
+  repository: placeholder  # Overridden by --set image.repository in pipeline
+  tag: latest              # Overridden by --set image.tag in pipeline
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  # annotations: {}
+  # host: myapp.example.com
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+# Spring Boot Actuator endpoints used for Kubernetes probes
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  initialDelaySeconds: 60
+  periodSeconds: 15
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+# Extra environment variables injected into the container
+env: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70

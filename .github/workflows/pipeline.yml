@@ -1,0 +1,206 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI/CD Pipeline — Spring Boot → ACR → AKS
+#
+# Single pipeline for develop, staging and prod.
+# Differences (ACR, AKS, namespace…) are driven by the variables of the
+# GitHub Environment that corresponds to each branch.
+#
+# The image is rebuilt in each environment. This is safe because the only
+# way code can reach staging is via PR from develop, and prod via PR from
+# staging — branch protection guarantees the source.
+#
+#   push develop  →  1·build-and-scan → 2·push-and-sign[⏸] → 3·verify-and-deploy dev
+#   push staging  →  1·build-and-scan → 2·push-and-sign[⏸] → 3·verify-and-deploy staging
+#   push prod     →  1·build-and-scan → 2·push-and-sign[⏸] → 3·verify-and-deploy prod
+#
+# REPOSITORY VARIABLES (Settings → Variables):
+#   AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# ENVIRONMENT VARIABLES (per GitHub Environment: develop | staging | prod):
+#   AZURE_CLIENT_ID, ACR_NAME, ACR_LOGIN_SERVER,
+#   AKS_CLUSTER_NAME, AKS_RESOURCE_GROUP, K8S_NAMESPACE, HELM_VALUES_FILE
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - develop
+      - staging
+      - prod
+    paths:
+      - "Dockerfile"
+      - "src/**"
+      - "helm/**"
+      - ".github/workflows/pipeline.yml"
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ── Job 1: Build & Scan ───────────────────────────────────────────────────
+  # Builds the image, saves it as a tar artifact and scans that tar.
+  # If Trivy finds a CRITICAL CVE, the pipeline fails here.
+  # No approval required — immediate feedback to the developer.
+  build-and-scan:
+    name: "1 · Build & Security Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: |
+          docker build \
+            --tag myapp:${{ github.sha }} \
+            --label "git.sha=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            .
+
+      # Save the tar BEFORE scanning. Job 2 loads this exact tar and
+      # pushes it — the scanned binary is the same one that gets deployed.
+      - name: Save image to tar
+        run: docker save myapp:${{ github.sha }} -o image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: image.tar
+          retention-days: 1
+
+      - name: Scan for critical vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "myapp:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"        # CRITICAL → fails the pipeline
+          severity: "CRITICAL"
+          vuln-type: "os,library"
+
+  # ── Job 2: Push & Sign ────────────────────────────────────────────────────
+  # Downloads the scanned tar, pushes it to the environment's ACR and signs it.
+  # The approval gate (GitHub Environment) blocks this job until a reviewer
+  # approves — this is the human control point.
+  push-and-sign:
+    name: "2 · Push & Sign"
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}   # ← approval gate
+
+    permissions:
+      contents: read
+      id-token: write   # Required for Azure OIDC login and Cosign keyless signing
+
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      # Federated Identity: the runner exchanges its GitHub OIDC token for a
+      # short-lived Azure AD access token. No client_secret stored anywhere.
+      - name: Azure Login (Federated Identity / OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Download scanned image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+
+      - name: Load image from artifact
+        run: docker load -i image.tar
+
+      - name: Push image to ACR
+        id: push
+        run: |
+          IMAGE="${{ vars.ACR_LOGIN_SERVER }}/myapp:${{ github.sha }}"
+          docker tag "myapp:${{ github.sha }}" "$IMAGE"
+          docker push "$IMAGE"
+          # Immutable digest (sha256:...) — we sign and verify by digest,
+          # not by tag, so a tag overwrite cannot bypass the control.
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: Cosign requests a GitHub Actions OIDC token →
+      # Sigstore Fulcio issues an ephemeral certificate encoding this
+      # workflow's identity → signs the digest → stores signature + cert
+      # as an OCI artifact in ACR. No private key stored anywhere.
+      - name: Sign image digest (Cosign keyless)
+        run: cosign sign --yes "${{ steps.push.outputs.digest }}"
+
+  # ── Job 3: Verify & Deploy ────────────────────────────────────────────────
+  # Verifies the signature in a separate job context (no shared state with the
+  # signing job), then deploys to the environment's AKS cluster. Environment
+  # variables (AKS_CLUSTER_NAME, K8S_NAMESPACE, HELM_VALUES_FILE…) resolve
+  # the correct target without any extra conditionals.
+  verify-and-deploy:
+    name: "3 · Verify & Deploy → ${{ github.ref_name }}"
+    needs: push-and-sign
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Federated Identity / OIDC)
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Verify that the digest has a valid signature issued by THIS workflow.
+      # An image pushed manually to ACR outside the pipeline has no signature → fails here.
+      - name: Verify image signature (Cosign)
+        run: |
+          cosign verify \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.github/workflows/pipeline.yml" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            "${{ needs.push-and-sign.outputs.digest }}"
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name           "${{ vars.AKS_CLUSTER_NAME }}" \
+            --overwrite-existing
+
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install myapp ./helm/myapp \
+            --namespace       "${{ vars.K8S_NAMESPACE }}" \
+            --create-namespace \
+            --values          "./helm/myapp/${{ vars.HELM_VALUES_FILE }}" \
+            --set image.repository="${{ vars.ACR_LOGIN_SERVER }}/myapp" \
+            --set image.tag="${{ github.sha }}" \
+            --atomic \
+            --timeout 5m
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/myapp \
+            --namespace "${{ vars.K8S_NAMESPACE }}" \
+            --timeout 5m
